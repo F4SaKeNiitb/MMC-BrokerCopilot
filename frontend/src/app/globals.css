@@ -1,0 +1,121 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --foreground-rgb: 0, 0, 0;
+  --background-start-rgb: 249, 250, 251;
+  --background-end-rgb: 255, 255, 255;
+}
+
+body {
+  color: rgb(var(--foreground-rgb));
+  background: linear-gradient(
+      to bottom,
+      transparent,
+      rgb(var(--background-end-rgb))
+    )
+    rgb(var(--background-start-rgb));
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f1f1;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #c1c1c1;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #a1a1a1;
+}
+
+/* Animation utilities */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes slideInUp {
+  from {
+    transform: translateY(20px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.3s ease-out;
+}
+
+.animate-slide-in-up {
+  animation: slideInUp 0.3s ease-out;
+}
+
+/* Prose styles for brief rendering */
+.prose h1 {
+  @apply text-2xl font-bold text-gray-900 mt-6 mb-4;
+}
+
+.prose h2 {
+  @apply text-xl font-semibold text-gray-900 mt-5 mb-3;
+}
+
+.prose h3 {
+  @apply text-lg font-medium text-gray-900 mt-4 mb-2;
+}
+
+.prose p {
+  @apply text-gray-700 my-2 leading-relaxed;
+}
+
+.prose ul {
+  @apply list-disc list-inside my-3 space-y-1;
+}
+
+.prose ol {
+  @apply list-decimal list-inside my-3 space-y-1;
+}
+
+.prose li {
+  @apply text-gray-700;
+}
+
+.prose strong {
+  @apply font-semibold text-gray-900;
+}
+
+.prose a {
+  @apply text-primary-600 hover:underline;
+}
+
+.prose blockquote {
+  @apply border-l-4 border-gray-200 pl-4 italic text-gray-600 my-4;
+}
+
+.prose code {
+  @apply bg-gray-100 px-1.5 py-0.5 rounded text-sm font-mono;
+}
+
+.prose pre {
+  @apply bg-gray-900 text-gray-100 p-4 rounded-lg overflow-x-auto my-4;
+}
+
+.prose pre code {
+  @apply bg-transparent p-0;
+}
