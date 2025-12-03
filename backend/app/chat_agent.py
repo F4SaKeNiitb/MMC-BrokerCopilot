@@ -20,6 +20,9 @@ from .llm.provenance import (
     inject_links, 
     calculate_confidence_score
 )
+from .core.logging import get_logger
+
+logger = get_logger(__name__)
 
 # Flag to control LLM usage
 USE_LLM = os.getenv("USE_LLM", "true").lower() == "true"
@@ -34,9 +37,11 @@ class ToolFunctions:
     def __init__(self, connectors_settings: Dict[str, Any]):
         self.mg = MicrosoftGraphConnector(connectors_settings.get("microsoft", {}))
         self.provenance: Dict[str, str] = {}
+        logger.debug("ToolFunctions initialized")
     
     async def get_policy_details(self, policy_id: str) -> Dict[str, Any]:
         """Retrieve policy details from CRM."""
+        logger.debug(f"Fetching policy details", extra={"policy_id": policy_id})
         # TODO: Replace with actual CRM connector call
         await asyncio.sleep(0)
         policy = {
@@ -53,17 +58,21 @@ class ToolFunctions:
             "link": f"https://crm.example.com/policy/{policy_id}"
         }
         self.provenance[policy_id] = policy["link"]
+        logger.debug(f"Retrieved policy details", extra={"policy_id": policy_id, "client": policy["client_name"]})
         return policy
     
     async def find_emails(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
         """Search for emails matching the query."""
+        logger.debug(f"Searching for emails", extra={"query": query, "limit": limit})
         emails = await self.mg.fetch_snippets(query=query, limit=limit)
         for email in emails:
             self.provenance[email["id"]] = email.get("link", "")
+        logger.debug(f"Found {len(emails)} emails")
         return emails
     
     async def find_meetings(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
         """Search for calendar meetings."""
+        logger.debug(f"Searching for meetings", extra={"query": query, "limit": limit})
         # TODO: Replace with actual Calendar connector call
         await asyncio.sleep(0)
         meetings = [
@@ -89,6 +98,7 @@ class ToolFunctions:
     
     async def get_client_info(self, client_identifier: str) -> Dict[str, Any]:
         """Look up client information."""
+        logger.debug(f"Looking up client info", extra={"client_identifier": client_identifier})
         # TODO: Replace with actual CRM connector call
         await asyncio.sleep(0)
         client = {
@@ -101,12 +111,15 @@ class ToolFunctions:
             "link": f"https://crm.example.com/client/{client_identifier}"
         }
         self.provenance[client["id"]] = client["link"]
+        logger.debug(f"Retrieved client info", extra={"client_id": client["id"], "name": client["name"]})
         return client
     
     async def calculate_renewal_priority(self, policy_id: str) -> Dict[str, Any]:
         """Calculate priority score for a policy renewal."""
+        logger.debug(f"Calculating renewal priority", extra={"policy_id": policy_id})
         policy = await self.get_policy_details(policy_id)
         score, breakdown = deterministic_score(policy)
+        logger.debug(f"Calculated priority score: {score:.2f}", extra={"policy_id": policy_id})
         return {
             "policy_id": policy_id,
             "score": score,
@@ -143,8 +156,12 @@ async def handle_chat_message(
         Dict with 'answer', 'confidence', 'provenance', and optionally 'function_calls'
     """
     message = payload.get("message", "").strip()
+    user_id = payload.get("user_id", "unknown")
+    
+    logger.info(f"Processing chat message", extra={"user_id": user_id, "message_length": len(message)})
     
     if not message:
+        logger.warning("Empty chat message received")
         return {
             "answer": "Please provide a question or request.",
             "confidence": 0.0,
@@ -154,13 +171,16 @@ async def handle_chat_message(
     tools = ToolFunctions(connectors_settings)
     
     if USE_LLM:
+        logger.debug("Processing with Gemini LLM")
         return await _handle_with_gemini(message, tools)
     else:
+        logger.debug("Processing with fallback handler (LLM disabled)")
         return await _handle_with_fallback(message, tools)
 
 
 async def _handle_with_gemini(message: str, tools: ToolFunctions) -> Dict[str, Any]:
     """Handle chat using Gemini with function-calling."""
+    logger.info("Starting Gemini chat processing")
     client = get_gemini_client()
     
     # Build function handlers map
@@ -187,6 +207,7 @@ async def _handle_with_gemini(message: str, tools: ToolFunctions) -> Dict[str, A
     ]
     
     try:
+        logger.debug("Calling Gemini with function-calling enabled")
         result = await client.generate_with_functions(
             messages=messages,
             config=config,
@@ -195,6 +216,14 @@ async def _handle_with_gemini(message: str, tools: ToolFunctions) -> Dict[str, A
         
         raw_answer = result.get("text", "")
         function_results = result.get("function_results", [])
+        
+        logger.debug(
+            "Gemini response received",
+            extra={
+                "function_calls": len(function_results),
+                "answer_length": len(raw_answer),
+            }
+        )
         
         # Inject citation links
         answer_with_links, citation_info = inject_links(raw_answer, tools.provenance)
@@ -208,6 +237,7 @@ async def _handle_with_gemini(message: str, tools: ToolFunctions) -> Dict[str, A
         
         # Apply hallucination guardrail - if no data was retrieved, lower confidence
         if not function_results and not tools.provenance:
+            logger.warning("No function calls or provenance data - applying hallucination guardrail")
             confidence = min(confidence, 0.3)
             if "I couldn't find" not in raw_answer and "not available" not in raw_answer.lower():
                 answer_with_links = (
@@ -215,6 +245,15 @@ async def _handle_with_gemini(message: str, tools: ToolFunctions) -> Dict[str, A
                     "Please try rephrasing or asking about a specific policy, client, or email."
                 )
                 confidence = 0.1
+        
+        logger.info(
+            "Chat response generated",
+            extra={
+                "confidence": confidence,
+                "citations": len(citation_info),
+                "function_calls": len(function_results),
+            }
+        )
         
         return {
             "answer": answer_with_links,
@@ -229,6 +268,7 @@ async def _handle_with_gemini(message: str, tools: ToolFunctions) -> Dict[str, A
         }
         
     except Exception as e:
+        logger.error(f"Gemini chat processing failed, using fallback", extra={"error": str(e)})
         # Fallback on error
         fallback_result = await _handle_with_fallback(message, tools)
         fallback_result["error"] = str(e)
@@ -240,6 +280,7 @@ async def _handle_with_fallback(message: str, tools: ToolFunctions) -> Dict[str,
     Fallback handler using pattern matching when LLM is unavailable.
     Demonstrates the function-calling concept without actual LLM.
     """
+    logger.debug("Processing message with fallback pattern matching")
     message_lower = message.lower()
     function_calls = []
     

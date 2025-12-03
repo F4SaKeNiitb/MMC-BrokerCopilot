@@ -14,6 +14,7 @@ import {
   X,
   Bell,
   User,
+  Mail,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui';
@@ -21,6 +22,7 @@ import { Button } from '@/components/ui';
 const navigation = [
   { name: 'Dashboard', href: '/', icon: LayoutDashboard },
   { name: 'Renewals', href: '/renewals', icon: FileText },
+  { name: 'Email', href: '/email', icon: Mail },
   { name: 'Chat', href: '/chat', icon: MessageSquare },
   { name: 'Connections', href: '/connections', icon: Shield },
   { name: 'Settings', href: '/settings', icon: Settings },

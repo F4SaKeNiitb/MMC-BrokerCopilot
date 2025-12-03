@@ -174,3 +174,121 @@ export interface ScoreResponse {
   breakdown: ScoreBreakdown;
   interpretation: string;
 }
+
+// ============================================================================
+// Email Scheduling Types
+// ============================================================================
+
+export type EmailStatus = 'pending' | 'queued' | 'sending' | 'sent' | 'failed' | 'cancelled';
+export type EmailPriority = 'low' | 'normal' | 'high' | 'urgent';
+export type RecurrenceType = 'none' | 'daily' | 'weekly' | 'monthly' | 'custom';
+
+export interface EmailRecipient {
+  email: string;
+  name?: string;
+  type: 'to' | 'cc' | 'bcc';
+  variables?: Record<string, unknown>;
+}
+
+export interface EmailAttachment {
+  filename: string;
+  content_type: string;
+  size_bytes: number;
+  storage_key?: string;
+  inline: boolean;
+}
+
+export interface ScheduledEmail {
+  id: string;
+  subject: string;
+  body_html?: string;
+  body_text?: string;
+  template_id?: string;
+  template_variables?: Record<string, unknown>;
+  from_email: string;
+  from_name?: string;
+  recipients: EmailRecipient[];
+  reply_to?: string;
+  attachments: EmailAttachment[];
+  scheduled_at: string;
+  timezone: string;
+  recurrence: RecurrenceType;
+  recurrence_end?: string;
+  recurrence_count?: number;
+  priority: EmailPriority;
+  status: EmailStatus;
+  policy_id?: string;
+  user_id: string;
+  campaign_id?: string;
+  tags: string[];
+  created_at: string;
+  updated_at: string;
+  sent_at?: string;
+  error_message?: string;
+  retry_count: number;
+  max_retries: number;
+  message_id?: string;
+  open_count: number;
+  click_count: number;
+}
+
+export interface EmailTemplate {
+  id: string;
+  name: string;
+  description?: string;
+  subject_template: string;
+  body_html_template: string;
+  body_text_template?: string;
+  category: string;
+  variables: string[];
+  user_id?: string;
+  is_system: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ScheduleEmailRequest {
+  subject: string;
+  body_html?: string;
+  body_text?: string;
+  template_id?: string;
+  template_variables?: Record<string, unknown>;
+  recipients: EmailRecipient[];
+  from_name?: string;
+  reply_to?: string;
+  scheduled_at: string;
+  timezone?: string;
+  recurrence?: RecurrenceType;
+  recurrence_end?: string;
+  priority?: EmailPriority;
+  policy_id?: string;
+  campaign_id?: string;
+  tags?: string[];
+}
+
+export interface ScheduleEmailResponse {
+  id: string;
+  status: EmailStatus;
+  scheduled_at: string;
+  message: string;
+}
+
+export interface EmailListResponse {
+  emails: ScheduledEmail[];
+  total: number;
+  page: number;
+  page_size: number;
+  has_more: boolean;
+}
+
+export interface EmailStatsResponse {
+  total_scheduled: number;
+  total_sent: number;
+  total_failed: number;
+  total_pending: number;
+  total_cancelled: number;
+  open_rate: number;
+  click_rate: number;
+  period_start: string;
+  period_end: string;
+}

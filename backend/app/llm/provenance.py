@@ -6,6 +6,10 @@ import re
 from typing import Dict, Any, List, Tuple
 from dataclasses import dataclass
 
+from ..core.logging import get_logger
+
+logger = get_logger(__name__)
+
 
 @dataclass
 class Citation:
@@ -27,6 +31,7 @@ def build_provenance_map(sources: Dict[str, List[Dict[str, Any]]]) -> Dict[str, 
     Returns:
         Dictionary mapping record IDs to their deep links.
     """
+    logger.debug("Building provenance map from sources")
     provenance = {}
     for source_type, records in sources.items():
         if isinstance(records, list):
@@ -42,6 +47,8 @@ def build_provenance_map(sources: Dict[str, List[Dict[str, Any]]]) -> Dict[str, 
             link = records.get("link")
             if record_id and link:
                 provenance[record_id] = link
+    
+    logger.debug(f"Built provenance map with {len(provenance)} entries")
     return provenance
 
 
@@ -66,6 +73,7 @@ def extract_citations(text: str) -> List[Citation]:
             end_pos=match.end()
         ))
     
+    logger.debug(f"Extracted {len(citations)} citations from text")
     return citations
 
 
@@ -85,6 +93,9 @@ def inject_links(text: str, provenance: Dict[str, str]) -> Tuple[str, List[Dict[
     
     # Process in reverse order to maintain positions
     result = text
+    resolved_count = 0
+    unresolved_count = 0
+    
     for citation in reversed(citations):
         link = provenance.get(citation.source_id, "")
         if link:
@@ -96,13 +107,25 @@ def inject_links(text: str, provenance: Dict[str, str]) -> Tuple[str, List[Dict[
                 "link": link,
                 "resolved": True
             })
+            resolved_count += 1
         else:
             # Keep the marker but note it's unresolved
+            unresolved_count += 1
             citation_info.insert(0, {
                 "source_id": citation.source_id,
                 "link": None,
                 "resolved": False
             })
+    
+    if citations:
+        logger.debug(
+            f"Injected links into text",
+            extra={
+                "total_citations": len(citations),
+                "resolved": resolved_count,
+                "unresolved": unresolved_count,
+            }
+        )
     
     return result, citation_info
 
@@ -118,6 +141,7 @@ def inject_links_html(text: str, provenance: Dict[str, str]) -> Tuple[str, List[
     Returns:
         Tuple of (html_with_links, list_of_citation_info)
     """
+    logger.debug("Injecting HTML links into citations")
     citations = extract_citations(text)
     citation_info = []
     
@@ -144,6 +168,7 @@ def inject_links_html(text: str, provenance: Dict[str, str]) -> Tuple[str, List[
                 "resolved": False
             })
     
+    logger.debug(f"Injected HTML links for {len(citations)} citations")
     return result, citation_info
 
 

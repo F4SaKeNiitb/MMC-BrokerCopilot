@@ -1,7 +1,9 @@
 {
+  "/_not-found/page": "app/_not-found/page.js",
   "/page": "app/page.js",
+  "/connections/page": "app/connections/page.js",
   "/renewals/page": "app/renewals/page.js",
-  "/chat/page": "app/chat/page.js",
   "/settings/page": "app/settings/page.js",
-  "/connections/page": "app/connections/page.js"
+  "/chat/page": "app/chat/page.js",
+  "/email/page": "app/email/page.js"
 }

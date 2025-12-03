@@ -6,7 +6,16 @@ Implements minimalist fetching - only retrieves metadata and snippets.
 import httpx
 from typing import Dict, Any, List, Optional
 from .base import BaseConnector
+from ..core.logging import get_logger
+from ..core.exceptions import (
+    MicrosoftGraphError,
+    ConnectorAuthRequiredError,
+    ServiceTimeoutError,
+    RateLimitError,
+)
 import asyncio
+
+logger = get_logger(__name__)
 
 
 class MicrosoftGraphConnector(BaseConnector):
@@ -58,8 +67,11 @@ class MicrosoftGraphConnector(BaseConnector):
         Uses Microsoft Search API for better relevance.
         Returns minimal data: id, subject, timestamp, snippet, link
         """
+        logger.debug(f"Fetching email snippets for query: {query[:50]}...")
+        
         if not self.access_token:
             # Return mock data if no token (for testing)
+            logger.debug("No access token, returning mock data")
             return self._mock_email_snippets(query, limit)
         
         try:
@@ -84,7 +96,20 @@ class MicrosoftGraphConnector(BaseConnector):
                 )
                 
                 if response.status_code == 401:
-                    raise ValueError("Access token expired or invalid")
+                    logger.warning("Access token expired or invalid")
+                    raise ConnectorAuthRequiredError(
+                        "Microsoft Graph access token expired or invalid",
+                        context={"status_code": 401}
+                    )
+                
+                if response.status_code == 429:
+                    retry_after = response.headers.get("Retry-After", "60")
+                    logger.warning(f"Rate limited by Microsoft Graph, retry after {retry_after}s")
+                    raise RateLimitError(
+                        "Microsoft Graph rate limit exceeded",
+                        service_name="microsoft_graph",
+                        retry_after=int(retry_after)
+                    )
                 
                 response.raise_for_status()
                 data = response.json()
@@ -101,10 +126,18 @@ class MicrosoftGraphConnector(BaseConnector):
                     "link": msg.get("webLink") or self._build_email_deep_link(msg["id"])
                 })
             
+            logger.debug(f"Fetched {len(results)} email snippets")
             return results
             
+        except httpx.TimeoutException:
+            logger.error("Microsoft Graph request timed out")
+            raise ServiceTimeoutError(
+                "Microsoft Graph request timed out",
+                service_name="microsoft_graph"
+            )
         except httpx.HTTPError as e:
-            # On error, return empty or mock data
+            logger.error(f"Microsoft Graph HTTP error: {e}")
+            # On error, return empty - don't fail the whole request
             return []
     
     async def search_emails(

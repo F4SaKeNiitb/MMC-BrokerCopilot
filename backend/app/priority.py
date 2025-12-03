@@ -1,5 +1,18 @@
+"""
+Priority Scoring Module
+
+Implements deterministic priority scoring for policy renewals based on:
+- Premium at risk (weighted 50%)
+- Time to expiry (weighted 35%)  
+- Claims frequency (weighted 15%)
+"""
 from math import exp
 from typing import Dict, Any, Tuple
+
+from .core.logging import get_logger
+
+logger = get_logger(__name__)
+
 
 def time_decay_score(days_to_expiry: float) -> float:
     """Non-linear decay: as expiry nears, priority increases.
@@ -11,6 +24,7 @@ def time_decay_score(days_to_expiry: float) -> float:
     k = 0.05
     return 1 - exp(-k * max(0.0, 90 - min(days_to_expiry, 90)))
 
+
 def deterministic_score(policy: Dict[str, Any]) -> Tuple[float, Dict[str, float]]:
     """Compute a deterministic priority score in [0,1].
     Inputs expected in policy dict:
@@ -19,6 +33,10 @@ def deterministic_score(policy: Dict[str, Any]) -> Tuple[float, Dict[str, float]
     - claims_frequency (float)
     Returns (score, breakdown)
     """
+    policy_id = policy.get("id", policy.get("policy_number", "unknown"))
+    
+    logger.debug(f"Calculating priority score for policy", extra={"policy_id": policy_id})
+    
     premium = float(policy.get("premium_at_risk", 0.0))
     days = float(policy.get("days_to_expiry", 90.0))
     claims = float(policy.get("claims_frequency", 0.0))
@@ -44,4 +62,16 @@ def deterministic_score(policy: Dict[str, Any]) -> Tuple[float, Dict[str, float]
         "time_component": w_time * decay,
         "claims_component": w_claims * claims_norm,
     }
+    
+    logger.debug(
+        f"Priority score calculated",
+        extra={
+            "policy_id": policy_id,
+            "score": round(score, 3),
+            "premium": premium,
+            "days_to_expiry": days,
+            "claims": claims,
+        }
+    )
+    
     return score, breakdown

@@ -229,3 +229,6 @@ export function Tooltip({ content, children }: TooltipProps) {
     </div>
   );
 }
+
+// Re-export error boundary components
+export { ErrorBoundary, ErrorFallback, InlineError, LoadingError } from './error-boundary';

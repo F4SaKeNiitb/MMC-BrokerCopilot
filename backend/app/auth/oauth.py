@@ -12,6 +12,10 @@ from dataclasses import dataclass, field
 from urllib.parse import urlencode, quote
 import httpx
 
+from ..core.logging import get_logger, log_exception
+
+logger = get_logger(__name__)
+
 # Configuration from environment
 AZURE_CLIENT_ID = os.getenv("AZURE_CLIENT_ID", "")
 AZURE_CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET", "")
@@ -254,22 +258,37 @@ class MicrosoftOAuthClient:
             "Content-Type": "application/x-www-form-urlencoded",
         }
         
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                self.token_endpoint,
-                data=data,
-                headers=headers
-            )
-            
-            if response.status_code != 200:
-                error_data = response.json()
-                raise OAuthError(
-                    error_data.get("error", "token_exchange_failed"),
-                    error_data.get("error_description", "Failed to exchange code for tokens"),
-                    status_code=response.status_code
+        logger.info(f"Exchanging authorization code for tokens (state: {state[:8]}...)")
+        
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    self.token_endpoint,
+                    data=data,
+                    headers=headers
                 )
-            
-            token_data = response.json()
+                
+                if response.status_code != 200:
+                    error_data = response.json()
+                    logger.error(
+                        f"Token exchange failed: {error_data.get('error')} - {error_data.get('error_description')}",
+                        extra={"status_code": response.status_code}
+                    )
+                    raise OAuthError(
+                        error_data.get("error", "token_exchange_failed"),
+                        error_data.get("error_description", "Failed to exchange code for tokens"),
+                        status_code=response.status_code
+                    )
+                
+                token_data = response.json()
+                logger.info("Token exchange successful")
+                
+        except httpx.TimeoutException:
+            logger.error("Token exchange timed out")
+            raise OAuthError("timeout", "Token exchange request timed out", status_code=504)
+        except httpx.HTTPError as e:
+            logger.error(f"HTTP error during token exchange: {e}")
+            raise OAuthError("http_error", f"HTTP error: {str(e)}", status_code=502)
         
         # Create TokenInfo
         token_info = TokenInfo(
@@ -302,6 +321,7 @@ class MicrosoftOAuthClient:
             OAuthError: If refresh fails (e.g., refresh token expired)
         """
         self._validate_config()
+        logger.debug("Attempting to refresh access token")
         
         data = {
             "client_id": self.client_id,
@@ -319,22 +339,35 @@ class MicrosoftOAuthClient:
             "Content-Type": "application/x-www-form-urlencoded",
         }
         
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                self.token_endpoint,
-                data=data,
-                headers=headers
-            )
-            
-            if response.status_code != 200:
-                error_data = response.json()
-                raise OAuthError(
-                    error_data.get("error", "token_refresh_failed"),
-                    error_data.get("error_description", "Failed to refresh token"),
-                    status_code=response.status_code
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    self.token_endpoint,
+                    data=data,
+                    headers=headers
                 )
-            
-            token_data = response.json()
+                
+                if response.status_code != 200:
+                    error_data = response.json()
+                    logger.warning(
+                        f"Token refresh failed: {error_data.get('error')}",
+                        extra={"status_code": response.status_code}
+                    )
+                    raise OAuthError(
+                        error_data.get("error", "token_refresh_failed"),
+                        error_data.get("error_description", "Failed to refresh token"),
+                        status_code=response.status_code
+                    )
+                
+                token_data = response.json()
+                logger.info("Token refresh successful")
+                
+        except httpx.TimeoutException:
+            logger.error("Token refresh timed out")
+            raise OAuthError("timeout", "Token refresh request timed out", status_code=504)
+        except httpx.HTTPError as e:
+            logger.error(f"HTTP error during token refresh: {e}")
+            raise OAuthError("http_error", f"HTTP error: {str(e)}", status_code=502)
         
         token_info = TokenInfo(
             access_token=token_data["access_token"],
@@ -356,6 +389,7 @@ class MicrosoftOAuthClient:
         - Stored in secure vault or encrypted session
         - Associated with proper user identity
         """
+        logger.debug(f"Storing token for user: {user_id}")
         self._tokens[user_id] = token_info
     
     def get_user_token(self, user_id: str) -> Optional[TokenInfo]:
@@ -364,6 +398,7 @@ class MicrosoftOAuthClient:
     
     def remove_user_token(self, user_id: str):
         """Remove stored token for a user (logout)."""
+        logger.debug(f"Removing token for user: {user_id}")
         self._tokens.pop(user_id, None)
     
     async def get_valid_token(self, user_id: str) -> Optional[TokenInfo]:
@@ -379,23 +414,30 @@ class MicrosoftOAuthClient:
         token_info = self.get_user_token(user_id)
         
         if not token_info:
+            logger.debug(f"No token found for user: {user_id}")
             return None
         
         if not token_info.is_expired:
+            logger.debug(f"Token for user {user_id} is still valid")
             return token_info
+        
+        logger.info(f"Token for user {user_id} is expired, attempting refresh")
         
         # Token is expired, try to refresh
         if not token_info.refresh_token:
             # No refresh token, user must re-authenticate
+            logger.warning(f"No refresh token for user {user_id}, requiring re-authentication")
             self.remove_user_token(user_id)
             return None
         
         try:
             new_token = await self.refresh_access_token(token_info.refresh_token)
             self.store_user_token(user_id, new_token)
+            logger.info(f"Token refreshed successfully for user {user_id}")
             return new_token
-        except OAuthError:
+        except OAuthError as e:
             # Refresh failed, remove token
+            logger.warning(f"Token refresh failed for user {user_id}: {e}")
             self.remove_user_token(user_id)
             return None
     
@@ -409,20 +451,33 @@ class MicrosoftOAuthClient:
         Returns:
             User profile dict with id, displayName, mail, etc.
         """
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(
-                "https://graph.microsoft.com/v1.0/me",
-                headers={"Authorization": f"Bearer {access_token}"}
-            )
-            
-            if response.status_code != 200:
-                raise OAuthError(
-                    "user_info_failed",
-                    f"Failed to fetch user info: {response.status_code}",
-                    status_code=response.status_code
+        logger.debug("Fetching user info from Microsoft Graph")
+        
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(
+                    "https://graph.microsoft.com/v1.0/me",
+                    headers={"Authorization": f"Bearer {access_token}"}
                 )
-            
-            return response.json()
+                
+                if response.status_code != 200:
+                    logger.error(f"Failed to fetch user info: {response.status_code}")
+                    raise OAuthError(
+                        "user_info_failed",
+                        f"Failed to fetch user info: {response.status_code}",
+                        status_code=response.status_code
+                    )
+                
+                user_info = response.json()
+                logger.debug(f"User info retrieved for: {user_info.get('displayName', 'unknown')}")
+                return user_info
+                
+        except httpx.TimeoutException:
+            logger.error("User info request timed out")
+            raise OAuthError("timeout", "User info request timed out", status_code=504)
+        except httpx.HTTPError as e:
+            logger.error(f"HTTP error fetching user info: {e}")
+            raise OAuthError("http_error", f"HTTP error: {str(e)}", status_code=502)
 
 
 # Singleton client instance
@@ -433,5 +488,6 @@ def get_oauth_client() -> MicrosoftOAuthClient:
     """Get or create the OAuth client singleton."""
     global _oauth_client
     if _oauth_client is None:
+        logger.debug("Creating Microsoft OAuth client singleton")
         _oauth_client = MicrosoftOAuthClient()
     return _oauth_client

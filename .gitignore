@@ -10,3 +10,8 @@ yarn-error.log*
 *.log
 *.swp
 *.swo  
+.venv/
+__pycache__/
+*.pyc
+.next/
+celerybeat-schedule

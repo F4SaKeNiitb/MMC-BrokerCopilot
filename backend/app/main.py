@@ -1,12 +1,28 @@
 import os
+import time
+import traceback
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Query, Depends
-from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
+from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, ValidationError as PydanticValidationError
 from dotenv import load_dotenv
 import asyncio
 from typing import Dict, Any, List, Optional
 
+from .core.logging import get_logger, configure_logging, LogContext
+from .core.exceptions import (
+    BrokerCopilotError,
+    ConfigurationError,
+    AuthenticationError,
+    ValidationError,
+    ExternalServiceError,
+    ConnectorError,
+    LLMError,
+    PDFGenerationError,
+    NotFoundError,
+)
+from .core.middleware import RequestContextMiddleware
 from .connectors.microsoft_graph import MicrosoftGraphConnector
 from .connectors.salesforce import SalesforceConnector
 from .connectors.hubspot import HubSpotConnector
@@ -14,17 +30,32 @@ from .brief import generate_brief, stream_brief
 from .chat_agent import handle_chat_message, stream_chat_response
 from .priority import deterministic_score
 from .templates import render_template
+from .pdf_generator import generate_brief_pdf, create_sample_brief_content
 from .auth.oauth import get_oauth_client, OAuthError, TokenInfo
 from .auth.salesforce_oauth import get_salesforce_oauth_client, SalesforceOAuthError, SalesforceTokenInfo
 from .auth.hubspot_oauth import get_hubspot_oauth_client, HubSpotOAuthError, HubSpotTokenInfo
+from .email.router import router as email_router
 
+# Initialize logging
 load_dotenv()
+configure_logging(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    json_format=os.getenv("LOG_FORMAT", "text").lower() == "json",
+)
+logger = get_logger(__name__)
 
 app = FastAPI(
     title="Broker Copilot - Backend",
     description="AI-augmented workflow platform for insurance brokers. Zero-storage, connector-driven architecture.",
     version="1.0.0"
 )
+
+# =============================================================================
+# Middleware Configuration
+# =============================================================================
+
+# Request context middleware (adds request ID, timing, logging)
+app.add_middleware(RequestContextMiddleware)
 
 # CORS middleware for frontend integration
 app.add_middleware(
@@ -34,6 +65,107 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# =============================================================================
+# Global Exception Handlers
+# =============================================================================
+
+@app.exception_handler(BrokerCopilotError)
+async def broker_copilot_exception_handler(request: Request, exc: BrokerCopilotError):
+    """Handle all Broker Copilot domain exceptions."""
+    logger.error(
+        f"Domain error: {exc.error_code.value} - {exc.message}",
+        extra={
+            "error_code": exc.error_code.value,
+            "http_status": exc.http_status,
+            "context": exc.context,
+            "path": request.url.path,
+        }
+    )
+    return JSONResponse(
+        status_code=exc.http_status,
+        content=exc.to_dict(),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Handle Pydantic validation errors from request parsing."""
+    errors = []
+    for error in exc.errors():
+        loc = " -> ".join(str(l) for l in error["loc"])
+        errors.append({
+            "field": loc,
+            "message": error["msg"],
+            "type": error["type"],
+        })
+    
+    logger.warning(
+        f"Validation error on {request.method} {request.url.path}",
+        extra={"errors": errors}
+    )
+    
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": True,
+            "error_code": "ERR_1003",
+            "message": "Request validation failed",
+            "detail": errors,
+        },
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handle FastAPI HTTPExceptions."""
+    logger.warning(
+        f"HTTP exception: {exc.status_code} - {exc.detail}",
+        extra={
+            "status_code": exc.status_code,
+            "path": request.url.path,
+        }
+    )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": True,
+            "error_code": f"HTTP_{exc.status_code}",
+            "message": str(exc.detail),
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """Handle any unhandled exceptions - last resort."""
+    # Log the full traceback
+    logger.exception(
+        f"Unhandled exception on {request.method} {request.url.path}",
+        extra={
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+        }
+    )
+    
+    # Don't expose internal errors in production
+    is_debug = os.getenv("DEBUG", "false").lower() == "true"
+    
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": True,
+            "error_code": "ERR_1001",
+            "message": "An internal server error occurred",
+            "detail": str(exc) if is_debug else "Please contact support if this persists",
+        },
+    )
+
+
+# Include email scheduling router
+app.include_router(email_router)
+
+logger.info("Broker Copilot backend initialized successfully")
 
 # In-memory ephemeral token store (per process only). Do NOT use in prod.
 # TODO: Replace with secure, per-user token vault or integrate with broker's SSO.
@@ -47,63 +179,95 @@ class AggregateQuery(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    """Health check endpoint for monitoring and load balancer probes."""
+    return {
+        "status": "ok",
+        "service": "broker-copilot",
+        "version": "1.0.0",
+        "timestamp": time.time(),
+    }
 
 
 @app.post("/aggregate")
 async def aggregate(q: AggregateQuery):
-    """Aggregate snippets from multiple connectors in parallel.
+    """
+    Aggregate snippets from multiple connectors in parallel.
     Returns source-level results plus which sources failed.
     """
-    connectors = []
+    logger.info(f"Aggregate request for query: {q.query[:50]}...")
+    
     results = {}
     failures = []
 
     # For now we only have MicrosoftGraphConnector in scaffold
     mg = MicrosoftGraphConnector({})
 
-    async def safe_fetch(name, coro):
+    async def safe_fetch(name: str, coro):
+        """Safely fetch from a connector with error handling."""
         try:
             res = await coro
             results[name] = res
-        except Exception as e:
+            logger.debug(f"Connector {name} returned {len(res)} results")
+        except asyncio.TimeoutError:
+            logger.warning(f"Connector {name} timed out")
+            failures.append({"source": name, "error": "Connection timed out"})
+        except ConnectorError as e:
+            logger.warning(f"Connector {name} error: {e}")
             failures.append({"source": name, "error": str(e)})
+        except Exception as e:
+            logger.error(f"Unexpected error from connector {name}: {e}", exc_info=True)
+            failures.append({"source": name, "error": f"Unexpected error: {type(e).__name__}"})
 
-    # Kick off concurrent fetches
-    tasks = [safe_fetch(mg.name, mg.fetch_snippets(query=q.query, limit=q.limit))]
-    await asyncio.wait_for(asyncio.gather(*tasks), timeout=3.0)
+    try:
+        # Kick off concurrent fetches with timeout
+        tasks = [safe_fetch(mg.name, mg.fetch_snippets(query=q.query, limit=q.limit))]
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=5.0)
+    except asyncio.TimeoutError:
+        logger.warning("Aggregate request timed out globally")
+        failures.append({"source": "aggregate", "error": "Global timeout exceeded"})
 
+    logger.info(f"Aggregate completed: {len(results)} sources, {len(failures)} failures")
     return {"results": results, "failures": failures}
 
 
 @app.get("/score/{policy_id}")
 async def score_policy(policy_id: str):
     """Calculate deterministic priority score for a policy renewal."""
-    # Mock policy fetch - in production this calls CRM connector
-    policy = {
-        "id": policy_id, 
-        "premium_at_risk": 125000.0, 
-        "days_to_expiry": 43, 
-        "claims_frequency": 1
-    }
-    score, breakdown = deterministic_score(policy)
+    logger.debug(f"Calculating score for policy: {policy_id}")
     
-    # Generate human-readable explanation
-    if score >= 0.8:
-        interpretation = "CRITICAL - Immediate action required"
-    elif score >= 0.6:
-        interpretation = "HIGH - Prioritize this week"
-    elif score >= 0.4:
-        interpretation = "MEDIUM - Schedule follow-up"
-    else:
-        interpretation = "LOW - Monitor and plan"
-    
-    return {
-        "policy": policy, 
-        "score": score, 
-        "breakdown": breakdown,
-        "interpretation": interpretation
-    }
+    try:
+        # Mock policy fetch - in production this calls CRM connector
+        policy = {
+            "id": policy_id, 
+            "premium_at_risk": 125000.0, 
+            "days_to_expiry": 43, 
+            "claims_frequency": 1
+        }
+        
+        score, breakdown = deterministic_score(policy)
+        
+        # Generate human-readable explanation
+        if score >= 0.8:
+            interpretation = "CRITICAL - Immediate action required"
+        elif score >= 0.6:
+            interpretation = "HIGH - Prioritize this week"
+        elif score >= 0.4:
+            interpretation = "MEDIUM - Schedule follow-up"
+        else:
+            interpretation = "LOW - Monitor and plan"
+        
+        logger.debug(f"Score for {policy_id}: {score:.2f} ({interpretation})")
+        
+        return {
+            "policy": policy, 
+            "score": score, 
+            "breakdown": breakdown,
+            "interpretation": interpretation
+        }
+        
+    except Exception as e:
+        logger.error(f"Error calculating score for policy {policy_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Score calculation failed: {str(e)}")
 
 
 @app.get("/brief/{policy_id}")
@@ -118,15 +282,106 @@ async def brief(policy_id: str, stream: bool = Query(default=True)):
     Query params:
     - stream: If true (default), streams the response. If false, returns JSON.
     """
-    if stream:
-        return StreamingResponse(
-            stream_brief(policy_id, connectors_settings={}),
-            media_type="text/plain"
+    logger.info(f"Generating brief for policy: {policy_id} (stream={stream})")
+    
+    try:
+        if stream:
+            return StreamingResponse(
+                stream_brief(policy_id, connectors_settings={}),
+                media_type="text/plain"
+            )
+        else:
+            # Non-streaming JSON response
+            data = await generate_brief(policy_id, connectors_settings={})
+            logger.debug(f"Brief generated successfully for {policy_id}")
+            return JSONResponse(data)
+    except LLMError as e:
+        logger.error(f"LLM error generating brief for {policy_id}: {e}")
+        raise HTTPException(status_code=502, detail=f"Brief generation failed: {str(e)}")
+    except ConnectorError as e:
+        logger.error(f"Connector error generating brief for {policy_id}: {e}")
+        raise HTTPException(status_code=502, detail=f"Data fetch failed: {str(e)}")
+    except Exception as e:
+        logger.error(f"Unexpected error generating brief for {policy_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Brief generation failed: {str(e)}")
+
+
+@app.get("/brief/{policy_id}/pdf")
+async def brief_pdf(policy_id: str):
+    """
+    Generate a PDF version of the one-page brief.
+    
+    - Fetches brief content (non-streaming)
+    - Converts to professional PDF with styling
+    - Returns PDF file for download
+    
+    Returns:
+        PDF file with Content-Disposition header for download
+    """
+    logger.info(f"Generating PDF brief for policy: {policy_id}")
+    
+    # Get policy data for context
+    policy = {
+        "id": policy_id,
+        "policy_number": policy_id,
+        "client_name": "ACME Corporation",
+        "premium_at_risk": 125000.0,
+        "expiry_date": "2026-01-15",
+        "days_to_expiry": 43,
+        "claims_frequency": 1,
+        "policy_type": "Commercial Property",
+    }
+    
+    # Calculate score
+    try:
+        score, _ = deterministic_score(policy)
+    except Exception as e:
+        logger.warning(f"Score calculation failed for {policy_id}, using default: {e}")
+        score = 0.5
+    
+    # Get brief content
+    content = None
+    try:
+        # Try to get actual brief content
+        brief_data = await generate_brief(policy_id, connectors_settings={})
+        content = brief_data.get("brief", "") if isinstance(brief_data, dict) else str(brief_data)
+        
+        # If content is empty or too short, use sample
+        if not content or len(content) < 100:
+            logger.debug(f"Brief content too short for {policy_id}, using sample")
+            content = create_sample_brief_content(policy_id, policy)
+    except Exception as e:
+        logger.warning(f"Brief generation failed for {policy_id}, using sample: {e}")
+        # Fallback to sample content
+        content = create_sample_brief_content(policy_id, policy)
+    
+    # Generate PDF
+    try:
+        pdf_bytes = generate_brief_pdf(
+            policy_id=policy_id,
+            content=content,
+            policy_data=policy,
+            score=score
         )
-    else:
-        # Non-streaming JSON response
-        data = await generate_brief(policy_id, connectors_settings={})
-        return JSONResponse(data)
+        logger.info(f"PDF generated successfully for {policy_id}, size: {len(pdf_bytes)} bytes")
+    except PDFGenerationError as e:
+        logger.error(f"PDF generation failed for {policy_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
+    except Exception as e:
+        logger.error(f"Unexpected error generating PDF for {policy_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
+    
+    # Return PDF response
+    filename = f"brief_{policy_id}_{int(time.time())}.pdf"
+    
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(pdf_bytes)),
+        }
+    )
 
 
 class ChatPayload(BaseModel):
@@ -150,23 +405,39 @@ async def chat(payload: ChatPayload):
     - "What's the priority score for POL-456?"
     - "Find emails about the Smith account renewal"
     """
-    if payload.stream:
-        return StreamingResponse(
-            stream_chat_response(payload.dict(), connectors_settings={}),
-            media_type="text/plain"
-        )
-    else:
-        res = await handle_chat_message(payload.dict(), connectors_settings={})
-        return JSONResponse(res)
+    logger.info(f"Chat request from user {payload.user_id}: {payload.message[:50]}...")
+    
+    try:
+        if payload.stream:
+            return StreamingResponse(
+                stream_chat_response(payload.dict(), connectors_settings={}),
+                media_type="text/plain"
+            )
+        else:
+            res = await handle_chat_message(payload.dict(), connectors_settings={})
+            logger.debug(f"Chat response generated for user {payload.user_id}")
+            return JSONResponse(res)
+    except LLMError as e:
+        logger.error(f"LLM error in chat for user {payload.user_id}: {e}")
+        raise HTTPException(status_code=502, detail=f"Chat processing failed: {str(e)}")
+    except Exception as e:
+        logger.error(f"Unexpected error in chat for user {payload.user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Chat processing failed: {str(e)}")
 
 
 @app.post("/chat/stream")
 async def chat_stream(payload: ChatPayload):
     """Streaming chat endpoint - always streams response."""
-    return StreamingResponse(
-        stream_chat_response(payload.dict(), connectors_settings={}),
-        media_type="text/plain"
-    )
+    logger.info(f"Streaming chat request from user {payload.user_id}")
+    
+    try:
+        return StreamingResponse(
+            stream_chat_response(payload.dict(), connectors_settings={}),
+            media_type="text/plain"
+        )
+    except Exception as e:
+        logger.error(f"Error in streaming chat for user {payload.user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Chat streaming failed: {str(e)}")
 
 
 class TemplatePayload(BaseModel):
@@ -183,11 +454,17 @@ async def render_template_endpoint(payload: TemplatePayload):
     - Returns both Markdown and HTML versions
     - Use for email templates, reports, etc.
     """
-    rendered = render_template(payload.template, payload.context)
-    # Return rendered markdown plus a simple HTML conversion
-    import markdown
-    html = markdown.markdown(rendered)
-    return {"markdown": rendered, "html": html}
+    logger.debug("Rendering template")
+    
+    try:
+        rendered = render_template(payload.template, payload.context)
+        # Return rendered markdown plus a simple HTML conversion
+        import markdown
+        html = markdown.markdown(rendered)
+        return {"markdown": rendered, "html": html}
+    except Exception as e:
+        logger.error(f"Template rendering failed: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Template rendering failed: {str(e)}")
 
 
 class RenewalFilter(BaseModel):
@@ -207,6 +484,8 @@ async def get_renewals(filters: RenewalFilter):
     - Supports filtering by time window, policy type, assignee
     - Returns pipeline data suitable for Kanban/list visualization
     """
+    logger.info(f"Fetching renewals with filters: {filters.dict()}")
+    
     # TODO: Replace with actual CRM connector call
     # Mock renewals data
     renewals = [

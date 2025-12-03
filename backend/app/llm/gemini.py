@@ -9,6 +9,18 @@ import httpx
 from typing import Dict, Any, List, AsyncGenerator, Optional, Callable
 from dataclasses import dataclass, field
 
+from ..core.logging import get_logger
+from ..core.exceptions import (
+    LLMError,
+    LLMAPIError,
+    LLMRateLimitError,
+    LLMContentFilterError,
+    LLMFunctionError,
+    ConfigurationError,
+)
+
+logger = get_logger(__name__)
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}"
@@ -90,14 +102,52 @@ class GeminiClient:
         config: GeminiConfig = None
     ) -> Dict[str, Any]:
         """Generate a non-streaming response from Gemini."""
+        if not self.api_key:
+            logger.error("Gemini API key not configured")
+            raise ConfigurationError("GEMINI_API_KEY not configured")
+        
         config = config or GeminiConfig()
         body = self._build_request_body(messages, config)
         url = f"{self.base_url}:generateContent?key={self.api_key}"
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(url, json=body, headers=self._build_headers())
-            response.raise_for_status()
-            return response.json()
+        logger.debug(f"Sending request to Gemini (model: {GEMINI_MODEL})")
+        
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(url, json=body, headers=self._build_headers())
+                
+                if response.status_code == 429:
+                    logger.warning("Gemini rate limit exceeded")
+                    raise LLMRateLimitError(
+                        "Gemini API rate limit exceeded",
+                        service_name="gemini"
+                    )
+                
+                if response.status_code == 400:
+                    error_data = response.json()
+                    error_msg = error_data.get("error", {}).get("message", "Bad request")
+                    if "safety" in error_msg.lower() or "block" in error_msg.lower():
+                        logger.warning(f"Content filtered by Gemini: {error_msg}")
+                        raise LLMContentFilterError(
+                            f"Content blocked by safety filter: {error_msg}",
+                            context={"error": error_data}
+                        )
+                    raise LLMAPIError(
+                        f"Gemini API error: {error_msg}",
+                        context={"status_code": 400, "error": error_data}
+                    )
+                
+                response.raise_for_status()
+                result = response.json()
+                logger.debug("Gemini response received successfully")
+                return result
+                
+        except httpx.TimeoutException:
+            logger.error("Gemini request timed out")
+            raise LLMError("Gemini request timed out", context={"timeout": 60})
+        except httpx.HTTPError as e:
+            logger.error(f"HTTP error calling Gemini: {e}")
+            raise LLMAPIError(f"HTTP error: {str(e)}", cause=e)
 
     async def generate_stream(
         self,
@@ -105,17 +155,26 @@ class GeminiClient:
         config: GeminiConfig = None
     ) -> AsyncGenerator[str, None]:
         """Generate a streaming response from Gemini, yielding text chunks."""
+        if not self.api_key:
+            logger.error("Gemini API key not configured")
+            raise ConfigurationError("GEMINI_API_KEY not configured")
+        
         config = config or GeminiConfig()
         body = self._build_request_body(messages, config)
         url = f"{self.base_url}:streamGenerateContent?alt=sse&key={self.api_key}"
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            async with client.stream("POST", url, json=body, headers=self._build_headers()) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if line.startswith("data: "):
-                        data = line[6:]
-                        if data.strip() == "[DONE]":
+        logger.debug(f"Starting streaming request to Gemini")
+        
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                async with client.stream("POST", url, json=body, headers=self._build_headers()) as response:
+                    if response.status_code == 429:
+                        raise LLMRateLimitError("Gemini rate limit exceeded", service_name="gemini")
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if line.startswith("data: "):
+                            data = line[6:]
+                            if data.strip() == "[DONE]":
                             break
                         try:
                             chunk = json.loads(data)

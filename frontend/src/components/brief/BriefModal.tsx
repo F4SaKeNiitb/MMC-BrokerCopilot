@@ -1,9 +1,9 @@
 'use client';
 
 import React, { useState, useEffect, useRef } from 'react';
-import { X, FileText, ExternalLink, AlertCircle, CheckCircle, Loader2, Copy, Check } from 'lucide-react';
+import { X, FileText, ExternalLink, AlertCircle, CheckCircle, Loader2, Copy, Check, Download } from 'lucide-react';
 import { Card, CardHeader, CardContent, Button, Badge, Skeleton } from '@/components/ui';
-import { streamBrief } from '@/lib/api';
+import { streamBrief, downloadBriefPdf } from '@/lib/api';
 import { cn } from '@/lib/utils';
 
 interface BriefModalProps {
@@ -16,6 +16,7 @@ export function BriefModal({ policyId, onClose }: BriefModalProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [downloadingPdf, setDownloadingPdf] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -60,6 +61,18 @@ export function BriefModal({ policyId, onClose }: BriefModalProps) {
     await navigator.clipboard.writeText(content);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleDownloadPdf = async () => {
+    setDownloadingPdf(true);
+    try {
+      await downloadBriefPdf(policyId);
+    } catch (err) {
+      console.error('Failed to download PDF:', err);
+      setError(err instanceof Error ? err.message : 'Failed to download PDF');
+    } finally {
+      setDownloadingPdf(false);
+    }
   };
 
   // Parse markdown-like content for basic rendering
@@ -168,6 +181,19 @@ export function BriefModal({ policyId, onClose }: BriefModalProps) {
                 Complete
               </Badge>
             )}
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleDownloadPdf}
+              disabled={!content || loading || downloadingPdf}
+              title="Download as PDF"
+            >
+              {downloadingPdf ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Download className="w-4 h-4" />
+              )}
+            </Button>
             <Button variant="ghost" size="sm" onClick={handleCopy} disabled={!content}>
               {copied ? (
                 <Check className="w-4 h-4 text-green-600" />

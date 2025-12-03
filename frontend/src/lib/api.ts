@@ -103,6 +103,40 @@ export async function* streamBrief(policyId: string): AsyncGenerator<string, voi
   }
 }
 
+export async function downloadBriefPdf(policyId: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/brief/${encodeURIComponent(policyId)}/pdf`);
+  
+  if (!response.ok) {
+    throw new APIError(response.status, 'Failed to download PDF');
+  }
+
+  // Get the blob from the response
+  const blob = await response.blob();
+  
+  // Create a download link
+  const url = window.URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  
+  // Get filename from Content-Disposition header or use default
+  const contentDisposition = response.headers.get('Content-Disposition');
+  let filename = `brief_${policyId}.pdf`;
+  if (contentDisposition) {
+    const match = contentDisposition.match(/filename="?([^"]+)"?/);
+    if (match) {
+      filename = match[1];
+    }
+  }
+  
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  
+  // Clean up
+  document.body.removeChild(link);
+  window.URL.revokeObjectURL(url);
+}
+
 // ============================================================================
 // Chat API (with streaming support)
 // ============================================================================
@@ -174,6 +208,114 @@ export async function startOAuth(provider: string = 'microsoft'): Promise<OAuthS
 
 export async function getOAuthStatus(userId: string): Promise<OAuthStatusResponse> {
   return fetchJSON(`${API_BASE}/oauth/status?user_id=${encodeURIComponent(userId)}`);
+}
+
+// ============================================================================
+// Email Scheduling API
+// ============================================================================
+
+import type {
+  ScheduleEmailRequest,
+  ScheduleEmailResponse,
+  EmailListResponse,
+  ScheduledEmail,
+  EmailTemplate,
+  EmailStatsResponse,
+  EmailStatus,
+} from './types';
+
+export async function scheduleEmail(
+  request: ScheduleEmailRequest,
+  userId: string,
+  fromEmail: string,
+): Promise<ScheduleEmailResponse> {
+  const params = new URLSearchParams({
+    user_id: userId,
+    from_email: fromEmail,
+  });
+  return fetchJSON(`${API_BASE}/email/schedule?${params}`, {
+    method: 'POST',
+    body: JSON.stringify(request),
+  });
+}
+
+export async function getScheduledEmails(
+  userId: string,
+  status?: EmailStatus,
+  page: number = 1,
+  pageSize: number = 20,
+): Promise<EmailListResponse> {
+  const params = new URLSearchParams({
+    user_id: userId,
+    page: String(page),
+    page_size: String(pageSize),
+  });
+  if (status) {
+    params.append('status', status);
+  }
+  return fetchJSON(`${API_BASE}/email/scheduled?${params}`);
+}
+
+export async function getScheduledEmail(emailId: string): Promise<ScheduledEmail> {
+  return fetchJSON(`${API_BASE}/email/scheduled/${encodeURIComponent(emailId)}`);
+}
+
+export async function cancelScheduledEmail(emailId: string): Promise<{ status: string; email_id: string }> {
+  return fetchJSON(`${API_BASE}/email/scheduled/${encodeURIComponent(emailId)}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function sendEmailNow(emailId: string): Promise<{ status: string; email_id: string; message: string }> {
+  return fetchJSON(`${API_BASE}/email/scheduled/${encodeURIComponent(emailId)}/send-now`, {
+    method: 'POST',
+  });
+}
+
+export async function getEmailsForPolicy(policyId: string): Promise<ScheduledEmail[]> {
+  return fetchJSON(`${API_BASE}/email/policy/${encodeURIComponent(policyId)}`);
+}
+
+export async function getEmailStats(userId: string, days: number = 30): Promise<EmailStatsResponse> {
+  const params = new URLSearchParams({
+    user_id: userId,
+    days: String(days),
+  });
+  return fetchJSON(`${API_BASE}/email/stats?${params}`);
+}
+
+export async function getEmailTemplates(category?: string, userId?: string): Promise<EmailTemplate[]> {
+  const params = new URLSearchParams();
+  if (category) params.append('category', category);
+  if (userId) params.append('user_id', userId);
+  return fetchJSON(`${API_BASE}/email/templates?${params}`);
+}
+
+export async function getEmailTemplate(templateId: string): Promise<EmailTemplate> {
+  return fetchJSON(`${API_BASE}/email/templates/${encodeURIComponent(templateId)}`);
+}
+
+export async function createEmailTemplate(template: Partial<EmailTemplate>, userId: string): Promise<EmailTemplate> {
+  return fetchJSON(`${API_BASE}/email/templates?user_id=${encodeURIComponent(userId)}`, {
+    method: 'POST',
+    body: JSON.stringify(template),
+  });
+}
+
+export async function deleteEmailTemplate(templateId: string): Promise<{ status: string; template_id: string }> {
+  return fetchJSON(`${API_BASE}/email/templates/${encodeURIComponent(templateId)}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function previewEmailTemplate(
+  templateId: string,
+  variables: Record<string, unknown> = {},
+): Promise<{ subject: string; body_html: string; body_text?: string; variables_used: Record<string, unknown> }> {
+  return fetchJSON(`${API_BASE}/email/templates/${encodeURIComponent(templateId)}/preview`, {
+    method: 'POST',
+    body: JSON.stringify(variables),
+  });
 }
 
 export async function refreshOAuth(userId: string): Promise<{ status: string }> {

@@ -6,6 +6,9 @@ import os
 import httpx
 from typing import Dict, Any, List, Optional
 from .base import BaseConnector
+from ..core.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 # Salesforce OAuth Configuration
@@ -37,17 +40,27 @@ class SalesforceConnector(BaseConnector):
         self.instance_url: Optional[str] = settings.get("instance_url")
         self.timeout = settings.get("timeout", 30.0)
         self.api_version = settings.get("api_version", SF_API_VERSION)
+        logger.debug(
+            "Initialized Salesforce connector",
+            extra={
+                "instance_url": self.instance_url,
+                "api_version": self.api_version,
+                "has_token": bool(self.access_token),
+            }
+        )
     
     @property
     def api_base(self) -> str:
         """Get the API base URL for this Salesforce instance."""
         if not self.instance_url:
+            logger.error("Salesforce instance URL not configured")
             raise ValueError("Salesforce instance URL not configured")
         return f"{self.instance_url}/services/data/{self.api_version}"
     
     def _get_headers(self) -> Dict[str, str]:
         """Get authorization headers."""
         if not self.access_token:
+            logger.error("Salesforce access token not configured")
             raise ValueError("Access token not configured. User must authenticate via OAuth.")
         return {
             "Authorization": f"Bearer {self.access_token}",
@@ -65,12 +78,20 @@ class SalesforceConnector(BaseConnector):
         Search across Salesforce objects for matching records.
         Uses SOSL (Salesforce Object Search Language) for full-text search.
         """
+        logger.info(
+            "Fetching Salesforce snippets",
+            extra={"query": query, "limit": limit}
+        )
+        
         if not self.access_token:
+            logger.debug("No access token, returning mock data")
             return self._mock_account_snippets(query, limit)
         
         try:
             # SOSL search across Account and Opportunity
             sosl_query = f"FIND {{{query}}} IN ALL FIELDS RETURNING Account(Id, Name, Industry, Phone, Website LIMIT {limit}), Opportunity(Id, Name, Amount, StageName, CloseDate LIMIT {limit})"
+            
+            logger.debug(f"Executing SOSL query", extra={"sosl": sosl_query})
             
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.get(
@@ -94,9 +115,17 @@ class SalesforceConnector(BaseConnector):
                     "link": self._build_record_link(record["Id"])
                 })
             
+            logger.info(
+                f"Found {len(results)} Salesforce records",
+                extra={"query": query, "result_count": len(results)}
+            )
             return results
             
-        except httpx.HTTPError:
+        except httpx.HTTPError as e:
+            logger.warning(
+                f"Salesforce API error, returning mock data",
+                extra={"error": str(e), "query": query}
+            )
             return self._mock_account_snippets(query, limit)
     
     def _build_snippet(self, record: Dict, obj_type: str) -> str:
@@ -110,13 +139,17 @@ class SalesforceConnector(BaseConnector):
     
     async def get_record(self, record_id: str) -> Dict[str, Any]:
         """Get a specific record by ID."""
+        logger.info(f"Fetching Salesforce record", extra={"record_id": record_id})
+        
         if not self.access_token:
+            logger.debug("No access token, returning mock record")
             return self._mock_account_record(record_id)
         
         try:
             # Try to determine object type and fetch
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 # First try Account
+                logger.debug(f"Trying to fetch as Account: {record_id}")
                 response = await client.get(
                     f"{self.api_base}/sobjects/Account/{record_id}",
                     headers=self._get_headers()
@@ -124,6 +157,7 @@ class SalesforceConnector(BaseConnector):
                 
                 if response.status_code == 200:
                     data = response.json()
+                    logger.info(f"Retrieved Account record", extra={"record_id": record_id})
                     return {
                         "id": data["Id"],
                         "source": self.name,
@@ -136,6 +170,7 @@ class SalesforceConnector(BaseConnector):
                     }
                 
                 # Try Opportunity
+                logger.debug(f"Trying to fetch as Opportunity: {record_id}")
                 response = await client.get(
                     f"{self.api_base}/sobjects/Opportunity/{record_id}",
                     headers=self._get_headers()
@@ -143,6 +178,7 @@ class SalesforceConnector(BaseConnector):
                 
                 if response.status_code == 200:
                     data = response.json()
+                    logger.info(f"Retrieved Opportunity record", extra={"record_id": record_id})
                     return {
                         "id": data["Id"],
                         "source": self.name,
@@ -154,18 +190,28 @@ class SalesforceConnector(BaseConnector):
                         "link": self._build_record_link(data["Id"])
                     }
             
+            logger.warning(f"Salesforce record not found", extra={"record_id": record_id})
             return {"error": "Record not found"}
             
-        except httpx.HTTPError:
+        except httpx.HTTPError as e:
+            logger.error(
+                f"Salesforce API error fetching record",
+                extra={"record_id": record_id, "error": str(e)}
+            )
             return self._mock_account_record(record_id)
     
     async def get_accounts(self, limit: int = 20) -> List[Dict[str, Any]]:
         """Get client accounts."""
+        logger.info(f"Fetching Salesforce accounts", extra={"limit": limit})
+        
         if not self.access_token:
+            logger.debug("No access token, returning mock accounts")
             return self._mock_accounts(limit)
         
         try:
             query = f"SELECT Id, Name, Industry, Phone, Website, BillingCity, BillingState, AnnualRevenue, CreatedDate FROM Account ORDER BY CreatedDate DESC LIMIT {limit}"
+            
+            logger.debug("Executing SOQL query for accounts", extra={"soql": query})
             
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.get(
@@ -176,7 +222,7 @@ class SalesforceConnector(BaseConnector):
                 response.raise_for_status()
                 data = response.json()
             
-            return [
+            accounts = [
                 {
                     "id": record["Id"],
                     "source": self.name,
@@ -193,7 +239,14 @@ class SalesforceConnector(BaseConnector):
                 for record in data.get("records", [])
             ]
             
-        except httpx.HTTPError:
+            logger.info(f"Retrieved {len(accounts)} Salesforce accounts")
+            return accounts
+            
+        except httpx.HTTPError as e:
+            logger.warning(
+                f"Salesforce API error fetching accounts, returning mock data",
+                extra={"error": str(e)}
+            )
             return self._mock_accounts(limit)
     
     async def get_opportunities(
@@ -210,7 +263,17 @@ class SalesforceConnector(BaseConnector):
             days_to_close: Filter by days until close date
             limit: Maximum records to return
         """
+        logger.info(
+            "Fetching Salesforce opportunities",
+            extra={
+                "stage": stage,
+                "days_to_close": days_to_close,
+                "limit": limit,
+            }
+        )
+        
         if not self.access_token:
+            logger.debug("No access token, returning mock opportunities")
             return self._mock_opportunities(limit)
         
         try:
@@ -231,6 +294,8 @@ class SalesforceConnector(BaseConnector):
                 LIMIT {limit}
             """
             
+            logger.debug("Executing SOQL query for opportunities")
+            
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.get(
                     f"{self.api_base}/query/",
@@ -240,7 +305,7 @@ class SalesforceConnector(BaseConnector):
                 response.raise_for_status()
                 data = response.json()
             
-            return [
+            opportunities = [
                 {
                     "id": record["Id"],
                     "source": self.name,
@@ -258,7 +323,17 @@ class SalesforceConnector(BaseConnector):
                 for record in data.get("records", [])
             ]
             
-        except httpx.HTTPError:
+            logger.info(
+                f"Retrieved {len(opportunities)} Salesforce opportunities",
+                extra={"stage": stage, "days_to_close": days_to_close}
+            )
+            return opportunities
+            
+        except httpx.HTTPError as e:
+            logger.warning(
+                "Salesforce API error fetching opportunities, returning mock data",
+                extra={"error": str(e)}
+            )
             return self._mock_opportunities(limit)
     
     async def get_renewals(self, days_ahead: int = 90, limit: int = 20) -> List[Dict[str, Any]]:
@@ -268,7 +343,13 @@ class SalesforceConnector(BaseConnector):
         This queries opportunities with renewal-related stages or custom renewal objects.
         Adjust the query based on your Salesforce schema.
         """
+        logger.info(
+            "Fetching Salesforce renewals",
+            extra={"days_ahead": days_ahead, "limit": limit}
+        )
+        
         if not self.access_token:
+            logger.debug("No access token, returning mock renewals")
             return self._mock_renewals(days_ahead, limit)
         
         try:
@@ -283,6 +364,8 @@ class SalesforceConnector(BaseConnector):
                 ORDER BY CloseDate ASC
                 LIMIT {limit}
             """
+            
+            logger.debug("Executing SOQL query for renewals")
             
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.get(
@@ -314,9 +397,17 @@ class SalesforceConnector(BaseConnector):
                     "link": self._build_record_link(record["Id"])
                 })
             
+            logger.info(
+                f"Retrieved {len(renewals)} Salesforce renewals",
+                extra={"days_ahead": days_ahead}
+            )
             return renewals
             
-        except httpx.HTTPError:
+        except httpx.HTTPError as e:
+            logger.warning(
+                "Salesforce API error fetching renewals, returning mock data",
+                extra={"error": str(e)}
+            )
             return self._mock_renewals(days_ahead, limit)
     
     def _calculate_days_to_date(self, date_str: str) -> int:
@@ -332,7 +423,13 @@ class SalesforceConnector(BaseConnector):
     
     async def get_contacts_for_account(self, account_id: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Get contacts associated with an account."""
+        logger.debug(
+            "Fetching contacts for Salesforce account",
+            extra={"account_id": account_id, "limit": limit}
+        )
+        
         if not self.access_token:
+            logger.debug("No access token, returning mock contacts")
             return self._mock_contacts(limit)
         
         try:

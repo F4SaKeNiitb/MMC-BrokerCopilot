@@ -6,6 +6,9 @@ import os
 import httpx
 from typing import Dict, Any, List, Optional
 from .base import BaseConnector
+from ..core.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 # HubSpot OAuth Configuration
@@ -36,10 +39,15 @@ class HubSpotConnector(BaseConnector):
         self.access_token: Optional[str] = settings.get("access_token")
         self.api_base = HUBSPOT_API_BASE
         self.timeout = settings.get("timeout", 30.0)
+        logger.debug(
+            "Initialized HubSpot connector",
+            extra={"has_token": bool(self.access_token)}
+        )
     
     def _get_headers(self) -> Dict[str, str]:
         """Get authorization headers."""
         if not self.access_token:
+            logger.error("HubSpot access token not configured")
             raise ValueError("Access token not configured. User must authenticate via OAuth.")
         return {
             "Authorization": f"Bearer {self.access_token}",
@@ -57,7 +65,13 @@ class HubSpotConnector(BaseConnector):
         """
         Search across HubSpot objects for matching records.
         """
+        logger.info(
+            "Fetching HubSpot snippets",
+            extra={"query": query, "limit": limit}
+        )
+        
         if not self.access_token:
+            logger.debug("No access token, returning mock company data")
             return self._mock_company_snippets(query, limit)
         
         try:
@@ -67,6 +81,8 @@ class HubSpotConnector(BaseConnector):
                 "limit": limit,
                 "properties": ["name", "industry", "phone", "website", "city", "state"]
             }
+            
+            logger.debug("Searching HubSpot companies", extra={"query": query})
             
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.post(
@@ -90,14 +106,25 @@ class HubSpotConnector(BaseConnector):
                     "link": self._build_record_link("company", record["id"])
                 })
             
+            logger.info(
+                f"Found {len(results)} HubSpot records",
+                extra={"query": query, "result_count": len(results)}
+            )
             return results
             
-        except httpx.HTTPError:
+        except httpx.HTTPError as e:
+            logger.warning(
+                "HubSpot API error, returning mock data",
+                extra={"error": str(e), "query": query}
+            )
             return self._mock_company_snippets(query, limit)
     
     async def get_record(self, record_id: str) -> Dict[str, Any]:
         """Get a specific company by ID."""
+        logger.info(f"Fetching HubSpot record", extra={"record_id": record_id})
+        
         if not self.access_token:
+            logger.debug("No access token, returning mock company record")
             return self._mock_company_record(record_id)
         
         try:
@@ -113,6 +140,7 @@ class HubSpotConnector(BaseConnector):
                 data = response.json()
             
             props = data.get("properties", {})
+            logger.info(f"Retrieved HubSpot company record", extra={"record_id": record_id})
             return {
                 "id": data["id"],
                 "source": self.name,
@@ -128,12 +156,19 @@ class HubSpotConnector(BaseConnector):
                 "link": self._build_record_link("company", data["id"])
             }
             
-        except httpx.HTTPError:
+        except httpx.HTTPError as e:
+            logger.warning(
+                "HubSpot API error fetching record, returning mock data",
+                extra={"record_id": record_id, "error": str(e)}
+            )
             return self._mock_company_record(record_id)
     
     async def get_companies(self, limit: int = 20) -> List[Dict[str, Any]]:
         """Get client companies."""
+        logger.info(f"Fetching HubSpot companies", extra={"limit": limit})
+        
         if not self.access_token:
+            logger.debug("No access token, returning mock companies")
             return self._mock_companies(limit)
         
         try:
@@ -149,7 +184,7 @@ class HubSpotConnector(BaseConnector):
                 response.raise_for_status()
                 data = response.json()
             
-            return [
+            companies = [
                 {
                     "id": record["id"],
                     "source": self.name,
@@ -166,7 +201,14 @@ class HubSpotConnector(BaseConnector):
                 for record in data.get("results", [])
             ]
             
-        except httpx.HTTPError:
+            logger.info(f"Retrieved {len(companies)} HubSpot companies")
+            return companies
+            
+        except httpx.HTTPError as e:
+            logger.warning(
+                "HubSpot API error fetching companies, returning mock data",
+                extra={"error": str(e)}
+            )
             return self._mock_companies(limit)
     
     async def get_deals(
@@ -183,7 +225,17 @@ class HubSpotConnector(BaseConnector):
             days_to_close: Filter by days until close date
             limit: Maximum records to return
         """
+        logger.info(
+            "Fetching HubSpot deals",
+            extra={
+                "stage": stage,
+                "days_to_close": days_to_close,
+                "limit": limit,
+            }
+        )
+        
         if not self.access_token:
+            logger.debug("No access token, returning mock deals")
             return self._mock_deals(limit)
         
         try:
@@ -213,6 +265,8 @@ class HubSpotConnector(BaseConnector):
                 ],
                 "sorts": [{"propertyName": "closedate", "direction": "ASCENDING"}]
             }
+            
+            logger.debug("Searching HubSpot deals", extra={"filter_count": len(filters)})
             
             if filters:
                 search_body["filterGroups"] = [{"filters": filters}]

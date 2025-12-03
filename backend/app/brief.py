@@ -11,6 +11,9 @@ from .connectors.microsoft_graph import MicrosoftGraphConnector
 from .priority import deterministic_score
 from .llm.gemini import get_gemini_client, GeminiConfig, BRIEF_SYSTEM_PROMPT
 from .llm.provenance import build_provenance_map, inject_links, calculate_confidence_score
+from .core.logging import get_logger
+
+logger = get_logger(__name__)
 
 # Flag to control LLM usage (can be disabled for testing)
 USE_LLM = os.getenv("USE_LLM", "true").lower() == "true"
@@ -20,8 +23,9 @@ async def fetch_policy_data(policy_id: str) -> Dict[str, Any]:
     """Fetch policy data from CRM connector.
     # TODO: Replace with actual CRM connector call using OAuth tokens.
     """
+    logger.debug(f"Fetching policy data for {policy_id}")
     await asyncio.sleep(0)
-    return {
+    policy = {
         "id": policy_id,
         "client_name": "ACME Corp",
         "policy_number": f"POL-{policy_id}",
@@ -35,14 +39,17 @@ async def fetch_policy_data(policy_id: str) -> Dict[str, Any]:
         "deductible": 5000.0,
         "link": f"https://crm.example.com/policy/{policy_id}"
     }
+    logger.debug(f"Retrieved policy data for {policy_id}", extra={"client": policy["client_name"]})
+    return policy
 
 
 async def fetch_meetings_data(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     """Fetch calendar meetings from Calendar connector.
     # TODO: Replace with actual Calendar connector call.
     """
+    logger.debug(f"Fetching meetings data", extra={"query": query, "limit": limit})
     await asyncio.sleep(0)
-    return [
+    meetings = [
         {
             "id": "mtg-1",
             "subject": "Renewal Discussion - ACME Corp",
@@ -60,14 +67,17 @@ async def fetch_meetings_data(query: str, limit: int = 5) -> List[Dict[str, Any]
             "link": "https://calendar.example.com/event/mtg-2"
         }
     ][:limit]
+    logger.debug(f"Retrieved {len(meetings)} meetings")
+    return meetings
 
 
 async def fetch_chats_data(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     """Fetch Teams chat mentions from Teams connector.
     # TODO: Replace with actual Teams connector call.
     """
+    logger.debug(f"Fetching chats data", extra={"query": query, "limit": limit})
     await asyncio.sleep(0)
-    return [
+    chats = [
         {
             "id": "chat-1",
             "subject": "Quick question about ACME renewal",
@@ -77,6 +87,8 @@ async def fetch_chats_data(query: str, limit: int = 5) -> List[Dict[str, Any]]:
             "link": "https://teams.microsoft.com/l/message/chat-1"
         }
     ][:limit]
+    logger.debug(f"Retrieved {len(chats)} chats")
+    return chats
 
 
 async def generate_brief(policy_id: str, connectors_settings: Dict[str, Any]) -> Dict[str, Any]:
@@ -91,18 +103,31 @@ async def generate_brief(policy_id: str, connectors_settings: Dict[str, Any]) ->
     Returns:
         Dictionary containing policy data, sources, narrative, and provenance map
     """
+    logger.info(f"Generating brief for policy", extra={"policy_id": policy_id})
     mg = MicrosoftGraphConnector(connectors_settings.get("microsoft", {}))
 
     # Parallel fetch from all sources
+    logger.debug("Fetching data from multiple sources in parallel")
     policy, emails, meetings, chats = await asyncio.gather(
         fetch_policy_data(policy_id),
         mg.fetch_snippets(query=policy_id, limit=5),
         fetch_meetings_data(policy_id, limit=5),
         fetch_chats_data(policy_id, limit=5)
     )
+    
+    logger.debug(
+        "Data fetched successfully",
+        extra={
+            "policy_id": policy_id,
+            "email_count": len(emails),
+            "meeting_count": len(meetings),
+            "chat_count": len(chats),
+        }
+    )
 
     # Calculate deterministic score
     score, breakdown = deterministic_score(policy)
+    logger.debug(f"Priority score calculated: {score:.2f}")
 
     # Build provenance map for citations
     sources = {
@@ -112,25 +137,46 @@ async def generate_brief(policy_id: str, connectors_settings: Dict[str, Any]) ->
         "chats": chats
     }
     provenance = build_provenance_map(sources)
+    logger.debug(f"Provenance map built with {len(provenance)} entries")
 
     # Generate narrative using LLM or fallback
     if USE_LLM:
-        narrative, raw_narrative = await generate_brief_via_gemini(
-            policy, emails, meetings, chats, score, breakdown
-        )
+        logger.info("Generating brief narrative via Gemini LLM")
+        try:
+            narrative, raw_narrative = await generate_brief_via_gemini(
+                policy, emails, meetings, chats, score, breakdown
+            )
+            logger.info("Brief narrative generated successfully via LLM")
+        except Exception as e:
+            logger.error(f"LLM generation failed, using fallback", extra={"error": str(e)})
+            narrative, raw_narrative = generate_brief_fallback(
+                policy, emails, meetings, chats, score, breakdown
+            )
     else:
+        logger.info("Generating brief narrative via fallback (LLM disabled)")
         narrative, raw_narrative = generate_brief_fallback(
             policy, emails, meetings, chats, score, breakdown
         )
 
     # Inject citation links
     narrative_with_links, citation_info = inject_links(raw_narrative, provenance)
+    logger.debug(f"Injected {len(citation_info)} citations into narrative")
 
     # Calculate confidence
     confidence = calculate_confidence_score(
         function_results=[],  # No function calls in brief generation
         citations_resolved=sum(1 for c in citation_info if c["resolved"]),
         citations_total=len(citation_info)
+    )
+    
+    logger.info(
+        f"Brief generated successfully",
+        extra={
+            "policy_id": policy_id,
+            "score": score,
+            "confidence": confidence,
+            "citation_count": len(citation_info),
+        }
     )
 
     return {
